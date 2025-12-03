@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+consistent_hash_ring.py
+
+Implements a consistent hashing ring with virtual nodes, using SHA-1 truncated to 64-bit.
+Includes a simulation harness to measure remapping percentage when nodes are added/removed
+and compares with a naive modulo-based hashing.
+"""
+
+import hashlib
+import bisect
+import random
+import statistics
+import time
+from typing import List, Dict, Tuple
+
+# ---------- Hash utility ----------
+def hash64(data: str) -> int:
+    """Return a stable 64-bit integer hash for the input string using SHA-1 truncated."""
+    h = hashlib.sha1(data.encode('utf-8')).digest()
+    # take first 8 bytes -> 64 bits, big-endian
+    return int.from_bytes(h[:8], byteorder='big', signed=False)
+
+# ---------- Consistent Hash Ring ----------
+class ConsistentHashRing:
+    def __init__(self, vnode_count: int = 100):
+        """
+        vnode_count: default number of virtual nodes per physical node.
+        Higher -> better balancing, more memory/ops.
+        """
+        self.vnode_count = vnode_count
+        self.ring: List[int] = []  # sorted list of vnode hashes
+        self.vnode_to_node: Dict[int, str] = {}  # map vnode hash -> physical node id
+        self.node_to_vnodes: Dict[str, List[int]] = {}  # map physical node -> list of vnode hashes
+
+    def _make_vnode_hash(self, node_id: str, index: int) -> int:
+        return hash64(f"{node_id}-{index}")
+
+    def add_node(self, node_id: str, vnode_count: int = None):
+        """Add a physical node with `vnode_count` virtual nodes (or default)."""
+        if vnode_count is None:
+            vnode_count = self.vnode_count
+
+        if node_id in self.node_to_vnodes:
+            raise ValueError(f"Node {node_id} already exists")
+
+        vnodes = []
+        for i in range(vnode_count):
+            h = self._make_vnode_hash(node_id, i)
+            # avoid collision — rare but check
+            while h in self.vnode_to_node:
+                # rehash with a salt if collision (extremely rare)
+                h = hash64(f"{node_id}-{i}-{random.random()}")
+            bisect.insort(self.ring, h)
+            self.vnode_to_node[h] = node_id
+            vnodes.append(h)
+
+        self.node_to_vnodes[node_id] = vnodes
+
+    def remove_node(self, node_id: str):
+        """Remove a physical node and its vnodes."""
+        if node_id not in self.node_to_vnodes:
+            raise ValueError(f"Node {node_id} not present")
+        vnodes = self.node_to_vnodes.pop(node_id)
+        for h in vnodes:
+            # remove from ring
+            idx = bisect.bisect_left(self.ring, h)
+            if idx < len(self.ring) and self.ring[idx] == h:
+                self.ring.pop(idx)
+            self.vnode_to_node.pop(h, None)
+
+    def get_node(self, key: str) -> str:
+        """Return the physical node id responsible for the given key."""
+        if not self.ring:
+            raise ValueError("Ring is empty")
+        h = hash64(key)
+        idx = bisect.bisect_right(self.ring, h)
+        if idx == len(self.ring):
+            idx = 0
+        vnode_hash = self.ring[idx]
+        return self.vnode_to_node[vnode_hash]
+
+    def get_distribution(self, keys: List[str]) -> Dict[str, int]:
+        """Return counts of keys mapped to each physical node."""
+        cnt: Dict[str, int] = {}
+        for k in keys:
+            node = self.get_node(k)
+            cnt[node] = cnt.get(node, 0) + 1
+        return cnt
+
+    def nodes(self) -> List[str]:
+        return list(self.node_to_vnodes.keys())
+
+    def vnode_count_total(self) -> int:
+        return len(self.ring)
+
+
+# ---------- Naive modulo hashing for comparison ----------
+def naive_modulo_map(keys: List[str], nodes: List[str]) -> Dict[str, int]:
+    """Map keys to nodes by converting key hash to integer mod len(nodes)."""
+    if not nodes:
+        raise ValueError("No nodes")
+    counts = {n: 0 for n in nodes}
+    for k in keys:
+        h = hash64(k)
+        node = nodes[h % len(nodes)]
+        counts[node] += 1
+    return counts
+
+# ---------- Simulation harness ----------
+class SimulationHarness:
+    def __init__(self, base_node_count: int = 10, vnode_count: int = 100, key_count: int = 100_000, seed: int = 42):
+        self.base_node_count = base_node_count
+        self.vnode_count = vnode_count
+        self.key_count = key_count
+        random.seed(seed)
+
+    def _make_nodes(self, n:int) -> List[str]:
+        return [f"node-{i}" for i in range(n)]
+
+    def _make_keys(self, k:int) -> List[str]:
+        # generate deterministic pseudo-random keys
+        return [f"key-{i}-{random.getrandbits(64)}" for i in range(k)]
+
+    def measure_remap_on_change(self, add_nodes: int = 0, remove_nodes: int = 0, verbose: bool = True) -> Dict[str, any]:
+        """
+        Create base ring with base_node_count nodes. Map keys. Then
+        add/remove nodes and re-map keys. Return remap percentages and distribution metrics.
+        """
+        nodes_before = self._make_nodes(self.base_node_count)
+        keys = self._make_keys(self.key_count)
+
+        # --- Consistent hash initial ---
+        ring = ConsistentHashRing(vnode_count=self.vnode_count)
+        for n in nodes_before:
+            ring.add_node(n)
+
+        mapping_before = {k: ring.get_node(k) for k in keys}
+
+        # modify node list for change
+        nodes_after = nodes_before.copy()
+
+        # remove nodes (choose the last N)
+        if remove_nodes > 0:
+            removed = nodes_after[-remove_nodes:]
+            for rn in removed:
+                ring.remove_node(rn)
+                nodes_after.remove(rn)
+
+        # add nodes (append new ids)
+        if add_nodes > 0:
+            new_nodes = [f"node-new-{i}" for i in range(add_nodes)]
+            for nn in new_nodes:
+                ring.add_node(nn)
+                nodes_after.append(nn)
+
+        mapping_after = {k: ring.get_node(k) for k in keys}
+
+        # measure remap percentage (consistent hashing)
+        remapped = sum(1 for k in keys if mapping_before[k] != mapping_after[k])
+        remap_pct = remapped / len(keys) * 100.0
+
+        # compute load distribution after change
+        dist_after = {}
+        for v in mapping_after.values():
+            dist_after[v] = dist_after.get(v, 0) + 1
+
+        # compute stats
+        mean_load = statistics.mean(dist_after.values())
+        sd_load = statistics.pstdev(dist_after.values()) if len(dist_after)>1 else 0.0
+
+        # --- Naive modulo for comparison ---
+        nodes_before_list = self._make_nodes(self.base_node_count)
+        nodes_after_list = nodes_before_list.copy()
+        if remove_nodes>0:
+            nodes_after_list = nodes_after_list[:-remove_nodes]
+        if add_nodes>0:
+            nodes_after_list = nodes_after_list + [f"node-new-{i}" for i in range(add_nodes)]
+
+        naive_before = naive_modulo_map(keys, nodes_before_list)
+        naive_after = naive_modulo_map(keys, nodes_after_list)
+
+        naive_remapped = 0
+        # For naive, need per-key before/after to assess remapping
+        for k in keys:
+            nb = nodes_before_list[hash64(k) % len(nodes_before_list)]
+            na = nodes_after_list[hash64(k) % len(nodes_after_list)]
+            if nb != na:
+                naive_remapped += 1
+        naive_remap_pct = naive_remapped / len(keys) * 100.0
+
+        if verbose:
+            print("=== Simulation Summary ===")
+            print(f"Base nodes: {len(nodes_before_list)}, vnode count per node: {self.vnode_count}, total keys: {len(keys)}")
+            print(f"Operation: add {add_nodes}, remove {remove_nodes}")
+            print(f"Consistent Hashing: remapped keys = {remapped} / {len(keys)} ({remap_pct:.4f}%)")
+            print(f"Naive Modulo Hashing: remapped keys = {naive_remapped} / {len(keys)} ({naive_remap_pct:.4f}%)")
+            print(f"After-change node count (consistent): {len(dist_after)}")
+            print(f"Load mean: {mean_load:.2f}, population stddev: {sd_load:.2f}")
+            # print a few load entries
+            sample = sorted(dist_after.items(), key=lambda x: -x[1])[:10]
+            print("Top node loads (node: count) sample:", sample)
+
+        return {
+            "remapped": remapped,
+            "remap_pct": remap_pct,
+            "naive_remapped": naive_remapped,
+            "naive_remap_pct": naive_remap_pct,
+            "load_dist_after": dist_after,
+            "mean_load": mean_load,
+            "sd_load": sd_load,
+            "keys_total": len(keys)
+        }
+
+# ---------- Example main ----------
+def main():
+    print("Running demo simulation (this may take 10-60 seconds depending on key_count)...")
+    sim = SimulationHarness(base_node_count=10, vnode_count=200, key_count=100_000, seed=12345)
+    # measure add 1 node
+    res_add = sim.measure_remap_on_change(add_nodes=1, remove_nodes=0, verbose=True)
+    # measure remove 1 node (10% if base=10)
+    res_remove = sim.measure_remap_on_change(add_nodes=0, remove_nodes=1, verbose=True)
+
+    print("\nDone. Save outputs to files for your report.")
+    # Useful: save small summary file
+    with open("sim_results_summary.txt", "w") as f:
+        f.write("Add 1 node results:\n")
+        f.write(str(res_add) + "\n\n")
+        f.write("Remove 1 node results:\n")
+        f.write(str(res_remove) + "\n")
+    print("Wrote sim_results_summary.txt")
+
+if __name__ == "__main__":
+    main()
